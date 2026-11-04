@@ -109,8 +109,10 @@
       this.pushCount = h('span', { class: 'pm-count', hidden: true });
 
       this.buttons = {
-        pull: button('Pull from YouTube', 'pull', 'Bring in new playlists and videos from YouTube. Your folders and changes here are kept.',
-          () => PM.syncUi.pull(this)),
+        pull: button('Pull from YouTube', 'pull',
+          'Bring in what changed on YouTube. Only playlists that changed are read; Shift-click to read everything again. ' +
+          'Your folders and changes here are kept.',
+          (event) => PM.syncUi.pull(this, { full: event.shiftKey })),
         push: button('Push to YouTube', 'push', 'Send the changes made here to your playlists on YouTube. You see them before anything changes.',
           () => PM.syncUi.push(this), this.pushCount),
         import: button('Import', 'import', 'Load a backup file', () => this.fileInput.click()),

@@ -6,7 +6,8 @@ A Chrome extension that adds a dashboard to the top of your YouTube playlists pa
 - sort playlists into folders, and folders into folders
 - drag and drop folders, playlists and videos, one at a time or several together
 - search folders, playlists and videos, and undo or redo any edit
-- pull your playlists and Liked videos from YouTube, as often as you like, without losing your folders
+- pull your playlists and Liked videos from YouTube, as often as you like, without losing your folders (after the
+  first pull, only the playlists that changed are read)
 - push the changes you make here (videos added, removed, moved or reordered) back to your playlists on YouTube
 - back everything up (the folder structure plus full video details) as one JSON file, and restore it
 
@@ -47,29 +48,44 @@ videos out of it, but not add, remove or reorder its videos.
 
 ## Syncing with YouTube
 
-**Pull from YouTube** reads your playlists and merges them into your library:
+**Pull from YouTube** brings in what changed on YouTube and merges it into your library:
 
 - New playlists are added at the top level, ready to sort into folders. Playlists you've filed in folders stay there.
 - Videos added to a playlist on YouTube appear in that playlist next to the same neighbours; videos removed on
   YouTube are removed here. Changes you made here and haven't pushed yet are kept.
+- A playlist reordered on YouTube takes YouTube's order, unless you reordered it here too. Then your order wins,
+  and Push sends it.
 - Playlists deleted on YouTube are removed here, and renamed ones are renamed.
 - Liked videos is replaced with what YouTube has. Deleted and private videos are kept and marked as unavailable.
 - If you sign in with a different channel from the one your library came from, you're asked before anything is replaced.
 
+A pull only reads what changed. YouTube gives each playlist a version tag, which changes when what YouTube reports
+about the playlist changes: its title, privacy, number of videos or thumbnail (normally its first video). A pull
+lists your playlists, which takes one request per 50, and reads only those whose tag is new, several at a time.
+Liked videos is read only when its newest likes or its size changed. Details are fetched only for videos new to
+your library. When nothing changed, a pull takes a few requests and a second or two.
+
+A quick pull can miss a change that leaves a playlist's size, first video and title as they were. Examples are one
+video swapped for another, or videos reordered below the first. **Shift-click Pull from YouTube** to read everything
+again: every playlist, Liked videos, and fresh details for every video, including titles, view counts, and which
+videos were deleted or made private. The first pull always reads everything.
+
 **Push to YouTube** sends the changes you've made here. The button shows how many are waiting, and each changed
 playlist shows a "to push" badge.
 
-- It pulls first, so changes made on YouTube in the meantime are never overwritten.
+- It first reads, in full, every playlist it's about to change, plus any whose tag changed on YouTube. So changes
+  made on YouTube in the meantime are merged in, never overwritten, even ones a quick pull would miss.
 - It then lists every change, playlist by playlist, along with the quota it will use, and only continues when you
   confirm.
-- Videos are added before they're removed, so a video moved between playlists is never missing from both if a push
-  stops halfway.
+- Only playlists with changes are written to. Videos are added before they're removed, so a video moved between
+  playlists is never missing from both if a push stops halfway.
 - Reordering uses the fewest moves possible.
 - If a push stops (for example, when the daily quota runs out), push again later to finish. Nothing is sent twice.
+- Afterwards it notes the pushed playlists' new version tags, so the next pull doesn't read them again.
 
-What it costs: reading costs 1 quota unit per 50 items, so a pull of 100 playlists with 5,000 videos uses about 250 of
-the 10,000 free daily units. Each change you push (adding, removing or moving one video) costs 50 units, so about 200
-changes fit in a day.
+What it costs: reading costs 1 quota unit per 50 items. A pull with nothing new uses 3 or 4 of the 10,000 free daily
+units. Reading everything (the first pull, or Shift-click) uses about 250 units for 100 playlists with 5,000 videos.
+Each change you push (adding, removing or moving one video) costs 50 units, so about 200 changes fit in a day.
 
 Not synced:
 
@@ -130,6 +146,7 @@ A backup is a single JSON document. The library is stored in the same shape.
       "open": false,
       "items": [{ "videoId": "…", "addedAt": "2024-05-01T10:00:00Z", "itemId": "…" }],
       "synced": ["…"],                                     // its YouTube entry IDs at the last pull or push
+      "syncedVersion": "…",                                // YouTube's version tag for the playlist then
       "youtube": { /* the playlist exactly as the YouTube API returned it */ }
     },
     "LL": { "title": "Liked videos", "kind": "liked", "items": [ … ], "synced": [ … ] }
@@ -142,9 +159,10 @@ A backup is a single JSON document. The library is stored in the same shape.
 
 - The data is flat: folders, playlists and videos each live in their own map keyed by ID, and the tree only lists
   IDs. A video's details are stored once even when it's in several playlists.
-- For syncing, each playlist entry keeps its YouTube ID (`itemId`), and each playlist keeps the list of entries
-  YouTube had at the last pull or push (`synced`). Comparing that list with what YouTube has now and what's here is
-  how a pull tells "added on YouTube" from "removed here", and how a push knows what to send.
+- For syncing, each playlist entry keeps its YouTube ID (`itemId`). Each playlist keeps the list of entries YouTube
+  had at the last pull or push (`synced`), and YouTube's version tag for it then (`syncedVersion`). Comparing that
+  list with what YouTube has now and what's here is how a pull tells "added on YouTube" from "removed here", and how
+  a push knows what to send. A pull skips playlists whose version tag hasn't changed.
 - `version` lets newer versions read older backups. Version 1 backups, and backups made before the app was renamed
   (`"format": "playlist-manager"`), still import.
 - An import is rejected, with the reasons shown, if the file breaks the rules. For example: an ID listed in two
@@ -153,7 +171,8 @@ A backup is a single JSON document. The library is stored in the same shape.
 
 The library is saved in `chrome.storage.local`, with the `unlimitedStorage` permission because full details for a few
 thousand videos exceed Chrome's default 10 MB. It's split into two keys: the structure, which is small and saved on
-every change, and the video details, which are large and saved only by Import and Pull. That keeps dragging fast.
+every change, and the video details, which are large and saved only by Import and by a pull that changed them. That
+keeps dragging and syncing fast.
 The data belongs to this Chrome profile; use Export and Import to move it to another computer.
 
 ## Development
@@ -164,8 +183,8 @@ There's no build step: the files in `extension/` are what Chrome loads.
 |---|---|
 | `extension/manifest.json` | Manifest V3. The content scripts run on youtube.com, but the dashboard only appears on `/feed/playlists`. |
 | `extension/lib/model.js` | Data model: rules, moves, copies, undo snapshots, validation, import/export. Pure JavaScript, also used by the tests. |
-| `extension/lib/sync.js` | Two-way sync: merging a pull, planning a push (fewest moves), and carrying it out safely. Pure JavaScript. |
-| `extension/lib/youtube-api.js` | YouTube Data API client: reading the library (with Liked videos) and adding, removing and moving entries. |
+| `extension/lib/sync.js` | Two-way sync: what a pull needs to read, merging it, planning a push (fewest moves), and carrying it out safely. Pure JavaScript. |
+| `extension/lib/youtube-api.js` | YouTube Data API client: reading the library (only what's asked, several requests at a time, with Liked videos) and adding, removing and moving entries. |
 | `extension/lib/storage.js` | Loading and saving in `chrome.storage.local`, and noticing changes from other tabs. |
 | `extension/background.js` | Service worker: Google sign-in and the pull and push sessions. The toolbar button opens the playlists page. |
 | `extension/content/main.js` | Finds the playlists page (YouTube changes pages without reloading) and places the dashboard above the grid. |
@@ -187,7 +206,8 @@ npm run test:e2e
 
 `npm test` runs the unit tests (model, sync, drag-and-drop rules, API client) with Node's built-in test runner. The
 sync tests pull from and push to the fake YouTube API, including quota running out halfway and playlists that
-aren't sorted manually. `npm run test:e2e` loads the extension into Chromium and drives the dashboard on a stand-in
+aren't sorted manually, and check which playlists each pull and push reads. The fake's version tags only change
+when a playlist's title, privacy, size or first video does, so the tests can't rely on YouTube reporting more. `npm run test:e2e` loads the extension into Chromium and drives the dashboard on a stand-in
 YouTube page, with Google sign-in stubbed and the fake YouTube API running in the extension's service worker. It needs
 Playwright first:
 

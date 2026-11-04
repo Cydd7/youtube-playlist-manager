@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "YouTube Playlist Manager",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Organize your YouTube playlists into folders, sync your changes back to YouTube, and back everything up as one JSON file.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAvhTkqC6wNDiniGLWe8RKps68dMdaqSqL4kjEpp1VOUkIRWml8Qn2gALLRBhKBxKGXsWhuJ7cqIY+n3JomZFtG48jzFBI4C9pl7OkUnz3jA3EGGabmusASyfVZWoVVvLiN6ndUeLCnBWsHUdfekJo3Ynnmtq999GXl9ULvvSz8jEdi+SOx80SXjaPAJMRvEDA5OVycfelKY14mWSzPdrfgqfdFMUHZObvzZ8tjD6cSkBpAuvnell4ElgQGWIyImb0uV9Vx5JuKlv73ulBSDz+VUBQekXZ5WHTZQ7UcbhT3pTFhqat4xoPC3som41wL3y6EeCjjMknZTg3tVanm/J8wQIDAQAB",
   "minimum_chrome_version": "116",

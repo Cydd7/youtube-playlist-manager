@@ -44,6 +44,9 @@ const playlistRow = (id) => page.locator(`${HOST} .pm-row[data-kind="playlist"][
 const videoIn = (playlistId, title) => page.locator(`${HOST} .pm-row[data-kind="video"][data-playlist="${playlistId}"][data-label="${title}"]`);
 const storage = () => worker.evaluate(() => chrome.storage.local.get(null));
 const onYouTube = (playlistId) => worker.evaluate((id) => self.fakeYouTube.videosIn(id), playlistId);
+const requestCount = () => worker.evaluate(() => self.fakeYouTube.state.requests.length);
+/** Which playlists' entries the fake YouTube was asked for since request number `from`. */
+const readsSince = (from) => worker.evaluate((n) => self.fakeYouTube.readsOf(n), from);
 
 /**
  * The visible tree as text: "F-" open folder, "F+" closed folder, "P-"/"P+"
@@ -496,9 +499,11 @@ step('organizes playlists into folders and copies videos out of Liked videos', a
 });
 
 step('pushes changes to YouTube after showing what will change', async () => {
+  const from = await requestCount();
   await button('Push to YouTube').click();
   await expectStatus(/^Push 3 changes to YouTube\? This uses about 150 of your 10,000 daily API units\.\n“Deep focus”: remove 1 video\n“Cooking”: add 2 videos/);
   assert.doesNotMatch(await page.locator(HOST).innerText(), /\bnull\b|undefined/);
+  assert.deepEqual(await readsSince(from), ['PLfocus', 'PLcook', 'LL'], 'only the playlists being pushed are read (and Liked videos checked)');
   await shot('5-push-question');
   await statusButton('Push 3 changes').click();
   await expectStatus(/^Pushed 3 changes to YouTube\./);
@@ -523,14 +528,16 @@ step('cancelling a push changes nothing on YouTube', async () => {
   assert.equal(await button('Push to YouTube').locator('.pm-count').innerText(), '1');
 });
 
-step('pulling again brings in YouTube changes without touching your folders', async () => {
+step('pulling again brings in YouTube changes without touching your folders, reading only what changed', async () => {
   await worker.evaluate(() => {
     self.fakeYouTube.addVideo('PLrun', 'new1');
     self.fakeYouTube.addPlaylist('PLguitar', 'Guitar', ['new2']);
     self.fakeYouTube.addVideo('LL', 'liked3', 0);
   });
+  const from = await requestCount();
   await button('Pull from YouTube').click();
-  await expectStatus(/^Pulled the latest from YouTube\. 1 change made here isn't on YouTube yet; Push to send it\.\nNew playlist “Guitar” \(1 video\), added at the top level\n“Morning run”: 1 new video/);
+  await expectStatus(/^Pulled the latest from YouTube\. 1 change made here isn't on YouTube yet; Push to send it\.\nNew playlist “Guitar” \(1 video\), added at the top level\n“Morning run”: 1 new video on YouTube/);
+  assert.deepEqual(await readsSince(from), ['PLrun', 'PLguitar', 'LL'], 'the pushed playlists are known to be unchanged');
   await expectTree([
     'P- Liked videos',
     '  V Liked: space documentary',
@@ -569,6 +576,25 @@ step('pushes the remaining reorder', async () => {
   await expectStatus(/^Pushed 1 change to YouTube\./);
   assert.deepEqual(await onYouTube('PLrun'), ['run2', 'run1', 'run3', 'new1']);
   await shot('6-synced');
+});
+
+step('a pull with nothing new reads no playlist; Shift-click reads everything again', async () => {
+  let from = await requestCount();
+  await button('Pull from YouTube').click();
+  await expectStatus(/^Already up to date with YouTube\.$/);
+  assert.deepEqual(await readsSince(from), ['LL']);
+
+  // A video swapped for another on YouTube, keeping the size and first video: YouTube's version tag stays the same.
+  await worker.evaluate(() => {
+    self.fakeYouTube.removeVideo('PLrun', 'run3');
+    self.fakeYouTube.addVideo('PLrun', 'focus1');
+  });
+  from = await requestCount();
+  await button('Pull from YouTube').click({ modifiers: ['Shift'] });
+  await expectStatus(/^Pulled the latest from YouTube\.\n“Morning run”: 1 new video, 1 removed on YouTube$/);
+  assert.deepEqual(await readsSince(from), ['PLrun', 'PLfocus', 'PLcook', 'PLguitar', 'LL']);
+  assert.ok(await videoIn('PLrun', 'Focus: lo-fi beats').isVisible());
+  assert.equal(await videoIn('PLrun', 'Run: cool-down').count(), 0);
 });
 
 step('loads a library saved by older versions', async () => {

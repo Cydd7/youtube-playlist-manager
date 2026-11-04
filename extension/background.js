@@ -1,7 +1,8 @@
 /*
  * Background service worker: Google sign-in and syncing with YouTube.
  *
- * The dashboard opens a port named "pm-sync" and sends { type: 'pull' } or
+ * The dashboard opens a port named "pm-sync" and sends { type: 'pull' },
+ * { type: 'pull', full: true } (read everything, not just what changed) or
  * { type: 'push' }. This worker reads the library from storage, talks to
  * YouTube, writes the result back to storage (every open dashboard picks it up
  * from there) and reports with { type: 'progress' | 'ask' | 'done' | 'error' }.
@@ -46,7 +47,7 @@ chrome.runtime.onConnect.addListener((port) => {
   });
   port.onMessage.addListener((message) => {
     if (message?.type === 'pull' || message?.type === 'push') {
-      runSync(message.type, { signal: controller.signal, send, ask });
+      runSync(message.type, { signal: controller.signal, send, ask, full: message.full === true });
     } else if ((message?.type === 'apply' || message?.type === 'cancel') && answer) {
       const resolve = answer;
       answer = null;
@@ -55,26 +56,25 @@ chrome.runtime.onConnect.addListener((port) => {
   });
 });
 
-async function runSync(mode, { signal, send, ask }) {
+async function runSync(mode, { signal, send, ask, full = false }) {
   if (syncRunning) {
     send({ type: 'error', text: 'A sync is already running in another tab.' });
     return;
   }
   syncRunning = true;
+  const progress = (text) => send({ type: 'progress', text });
   try {
-    send({ type: 'progress', text: 'Waiting for Google sign-in…' });
+    progress('Waiting for Google sign-in…');
     const token = await getToken(mode === 'push' ? WRITE_SCOPE : READ_SCOPE);
     const youtube = PM.youtube.client({ token, signal, fetch: (...args) => fetch(...args) });
-    const remote = await youtube.fetchLibrary((text) => send({ type: 'progress', text }));
 
-    let doc = await PM.storage.loadDoc();
-    if (PM.model.validate(doc).length) {
-      throw new Error('The saved library looks damaged, so nothing was synced. Import a backup first.');
-    }
-
+    progress('Reading your channel…');
+    const channel = await youtube.fetchChannel();
+    let doc = await loadLibrary();
+    let replacing = false;
     const owner = PM.sync.libraryChannel(doc);
-    if (owner && owner.id !== remote.channel.id) {
-      const signedIn = remote.channel.title || remote.channel.id;
+    if (owner && owner.id !== channel.id) {
+      const signedIn = channel.title || channel.id;
       const reply = await ask({
         text: `Your library's playlists come from “${owner.title || owner.id}”, but you signed in as “${signedIn}”.`,
         details: [
@@ -88,21 +88,32 @@ async function runSync(mode, { signal, send, ask }) {
         send({ type: 'done', kind: 'info', text: 'Nothing was changed.' });
         return;
       }
+      replacing = true;
       doc = PM.model.emptyDoc();
     }
 
-    send({ type: 'progress', text: 'Merging with your library…' });
+    // Only playlists that changed on YouTube are read, plus, for a push, the ones it's about to change.
+    const targets = mode === 'push' ? PM.sync.planPush(doc).playlists.map((p) => p.id) : [];
+    const remote = await youtube.fetchLibrary(channel, PM.sync.readOptions(doc, { full, targets }), progress);
+
+    progress('Merging with your library…');
+    if (!replacing) doc = await loadLibrary(); // the latest, in case another tab saved meanwhile
     const summary = PM.sync.merge(doc, remote);
-    await PM.storage.saveDoc(doc, 'sync');
-    const plan = PM.sync.planPush(doc);
+    // The video details are large: they're only saved again when they changed.
+    if (summary.videosChanged) await PM.storage.saveDoc(doc, 'sync');
+    else await PM.storage.saveStructure(doc, 'sync');
     if (mode === 'pull') {
-      send({ type: 'done', ...PM.sync.describePull(summary, plan.total) });
+      send({ type: 'done', ...PM.sync.describePull(summary, PM.sync.planPush(doc).total) });
       return;
     }
 
-    const pulled = PM.sync.describePull(summary);
+    // Only playlists just read are pushed: their entries are known to be YouTube's latest.
+    const plan = PM.sync.planPush(doc, Object.keys(remote.items));
     if (!plan.total) {
-      send({ type: 'done', kind: 'success', text: 'Nothing to push: YouTube already matches your library.', details: pulled.details });
+      const text = PM.sync.planPush(doc).total
+        ? "Changes made in another tab while this push was starting weren't pushed. Push again to send them."
+        : 'Nothing to push: YouTube already matches your library.';
+      send({ type: 'done', kind: 'success', text, details: PM.sync.describePull(summary).details });
       return;
     }
     if ((await ask(PM.sync.describePlan(plan))) !== 'apply') {
@@ -110,14 +121,25 @@ async function runSync(mode, { signal, send, ask }) {
       return;
     }
 
+    const pushed = plan.playlists.map((p) => p.id);
+    PM.sync.forgetVersions(doc, pushed);
+    await PM.storage.saveStructure(doc, 'sync');
     const result = await PM.sync.executePush(doc, plan, {
       insert: youtube.insertItem,
       remove: youtube.deleteItem,
       move: youtube.moveItem,
-      onProgress: (done, total) => send({ type: 'progress', text: `Pushing to YouTube… ${done} of ${total}` }),
+      onProgress: (done, total) => progress(`Pushing to YouTube… ${done} of ${total}`),
       checkpoint: () => PM.storage.saveStructure(doc, 'sync'),
     });
     doc.sync = { ...doc.sync, pushedAt: new Date().toISOString() };
+    if (!result.stopped) {
+      // Learn the pushed playlists' new versions, so the next pull doesn't read them again.
+      try {
+        PM.sync.recordVersions(doc, pushed, await youtube.fetchPlaylists());
+      } catch (err) {
+        console.warn("Couldn't read the pushed playlists' new versions; the next pull reads them.", err);
+      }
+    }
     await PM.storage.saveStructure(doc, 'sync');
     if (result.stopped?.status === 401) await forgetToken();
     send({ type: 'done', ...PM.sync.describePush(result) });
@@ -128,6 +150,14 @@ async function runSync(mode, { signal, send, ask }) {
   } finally {
     syncRunning = false;
   }
+}
+
+async function loadLibrary() {
+  const doc = await PM.storage.loadDoc();
+  if (PM.model.validate(doc).length) {
+    throw new Error('The saved library looks damaged, so nothing was synced. Import a backup first.');
+  }
+  return doc;
 }
 
 /**

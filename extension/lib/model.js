@@ -5,13 +5,14 @@
  *
  *   root       IDs of the top-level folders and playlists, in display order
  *   folders    { [folderId]:   { name, open, children: [folderId | playlistId] } }
- *   playlists  { [playlistId]: { title, open, items: [{ videoId, addedAt, itemId }], youtube, synced, kind } }
+ *   playlists  { [playlistId]: { title, open, items: [{ videoId, addedAt, itemId }], youtube, synced, syncedVersion, kind } }
  *   videos     { [videoId]:    video data exactly as the YouTube Data API returned it }
  *   sync       { channelId, channelTitle, pulledAt, pushedAt }   (after the first pull)
  *
- * For syncing, a playlist entry's `itemId` is its ID on YouTube, and a
- * playlist's `synced` lists the YouTube entry IDs it had at the last pull or
- * push (see sync.js). `kind: 'liked'` marks the read-only Liked videos list.
+ * For syncing, a playlist entry's `itemId` is its ID on YouTube, a playlist's
+ * `synced` lists the YouTube entry IDs it had at the last pull or push, and
+ * `syncedVersion` is YouTube's version tag for the playlist then (see sync.js).
+ * `kind: 'liked'` marks the read-only Liked videos list.
  *
  * Rules: a folder holds folders and playlists, a playlist holds videos, and
  * every folder and playlist sits in exactly one place. A video's details are
@@ -373,6 +374,7 @@
       if (playlist.open !== undefined && typeof playlist.open !== 'boolean') fail(`Playlist "${id}": "open" must be true or false.`);
       if (playlist.kind !== undefined && playlist.kind !== LIKED) fail(`Playlist "${id}": unknown "kind".`);
       if (playlist.synced !== undefined && !isStringList(playlist.synced)) fail(`Playlist "${id}": "synced" must be a list of IDs.`);
+      if (playlist.syncedVersion !== undefined && typeof playlist.syncedVersion !== 'string') fail(`Playlist "${id}": "syncedVersion" must be text.`);
       if (!Array.isArray(playlist.items)) {
         fail(`Playlist "${id}" needs an "items" list.`);
         continue;
