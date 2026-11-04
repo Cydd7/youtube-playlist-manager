@@ -8,6 +8,11 @@
  *   const yt = createFakeYouTube({ playlists: [{ id, title, videos: [videoId, …] }], liked: [videoId, …], videos: { id: { title } } });
  *   yt.fetch(url, init)   // drop-in for fetch
  *   yt.videosIn(id)       // a playlist's video IDs on "YouTube"
+ *   yt.state.requests     // every request: { method, path, params }
+ *
+ * Like YouTube's, a playlist's etag only changes when what the API says about
+ * the playlist changes (here: its title, privacy, size and first video), not
+ * when videos further down are swapped or reordered.
  */
 (() => {
   function createFakeYouTube({
@@ -36,6 +41,7 @@
       quota,
       used: 0,
       calls: [],
+      requests: [],
     };
 
     const find = (id) => state.playlists.find((p) => p.id === id);
@@ -89,6 +95,7 @@
       const method = (init.method || 'GET').toUpperCase();
       const path = url.pathname.split('/').pop();
       state.calls.push(`${method} ${path}`);
+      state.requests.push({ method, path, params: Object.fromEntries(params) });
 
       const access = tokens[(init.headers?.Authorization || '').replace(/^Bearer /, '')];
       if (!access) return fail(401, 'authError', 'Invalid Credentials');
@@ -112,7 +119,7 @@
         case 'GET playlists':
           return page(state.playlists.map((p) => ({
             kind: 'youtube#playlist',
-            etag: 'e',
+            etag: `v:${p.title}|${p.privacy}|${p.items.length}|${p.items[0]?.videoId ?? ''}`,
             id: p.id,
             snippet: { title: p.title, channelId: state.channel.id, channelTitle: state.channel.title },
             status: { privacyStatus: p.privacy },
@@ -194,8 +201,19 @@
         const items = id === 'LL' ? state.liked : find(id).items;
         items.splice(items.findIndex((item) => item.videoId === videoId), 1);
       },
+      moveVideo(id, from, to) {
+        const items = find(id).items;
+        items.splice(to, 0, ...items.splice(from, 1));
+      },
       rename(id, title) {
         find(id).title = title;
+      },
+      renameVideo(videoId, title) {
+        state.videos[videoId] = { ...state.videos[videoId], title };
+      },
+      /** Which playlists' entries were read (GET playlistItems), in order, from request number `from` on. */
+      readsOf(from = 0) {
+        return state.requests.slice(from).filter((r) => r.method === 'GET' && r.path === 'playlistItems').map((r) => r.params.playlistId);
       },
     };
   }

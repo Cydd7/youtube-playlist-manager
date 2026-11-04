@@ -12,11 +12,12 @@
 
   let running = false;
 
-  async function run(app, mode) {
+  /** `full`: read everything from YouTube again, not just the playlists that changed. */
+  async function run(app, mode, { full = false } = {}) {
     if (running) return;
     running = true;
     app.setBusy(true);
-    app.setStatus(mode === 'push' ? 'Checking YouTube before pushing…' : 'Starting…', 'progress');
+    app.setStatus(mode === 'push' ? 'Checking YouTube before pushing…' : full ? 'Reading everything from YouTube…' : 'Checking YouTube for changes…', 'progress');
     await app.flushSave(); // the worker reads the library from storage
 
     let port = null;
@@ -73,11 +74,11 @@
       finish();
       app.setStatus('The sync stopped unexpectedly. Try again.', 'error');
     });
-    post({ type: mode });
+    post({ type: mode, full });
   }
 
   PM.syncUi = {
-    pull: (app) => run(app, 'pull'),
+    pull: (app, options) => run(app, 'pull', options),
     push: (app) => run(app, 'push'),
   };
 })();

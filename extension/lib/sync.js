@@ -6,9 +6,15 @@
  * (`itemId`). Comparing what YouTube had then, what it has now and what is
  * here tells changes made on YouTube apart from changes made here:
  *
+ *   readOptions(doc)              what a pull needs to read: only playlists that changed
  *   merge(doc, remote)            pull: YouTube's changes come in, changes made here are kept
  *   planPush(doc)                 what a push would add, remove and reorder on YouTube
  *   executePush(doc, plan, api)   push: does it, keeping `synced` true to YouTube after every call
+ *
+ * Each playlist also remembers YouTube's version tag for it (its etag) from
+ * when `synced` was read (`syncedVersion`). The tag changes when YouTube's
+ * description of the playlist changes (its title, its number of videos, its
+ * thumbnail…), so a pull reads only playlists whose tag is new.
  *
  * Folders only exist here. Liked videos is read-only: a pull replaces it and
  * a push leaves it alone. Pure data code: no DOM, no chrome.* APIs.
@@ -26,6 +32,8 @@
   const M = () => PM.model;
   const plural = (n, word) => `${n.toLocaleString()} ${word}${n === 1 ? '' : 's'}`;
   const videoIdOf = (raw) => raw.contentDetails?.videoId ?? raw.snippet?.resourceId?.videoId;
+  const hasOwn = (obj, key) => Object.prototype.hasOwnProperty.call(obj, key);
+  const sameOrder = (a, b) => a.length === b.length && a.every((x, i) => x === b[i]);
 
   /** YouTube's entries for one playlist, in order. */
   function entriesOf(rawItems = []) {
@@ -56,6 +64,40 @@
     delete doc.playlists[id];
   }
 
+  function setVersion(playlist, version) {
+    if (version) playlist.syncedVersion = version;
+    else delete playlist.syncedVersion;
+  }
+
+  // ---------------------------------------------------------------------------
+  // What to read
+
+  /**
+   * Whether a pull must read a playlist's entries: it's new here, or YouTube's
+   * version tag for it isn't the one its entries were last read at.
+   */
+  function needsReading(doc, resource) {
+    const playlist = M().getPlaylist(doc, resource.id);
+    return !playlist || !Array.isArray(playlist.synced) || !resource.etag || playlist.syncedVersion !== resource.etag;
+  }
+
+  /**
+   * What a pull reads (the options of fetchLibrary in youtube-api.js): playlists
+   * that are new or changed on YouTube, plus `targets`, which are always read
+   * (a push reads the playlists it's about to change); Liked videos if it
+   * changed; details of videos new to the library. `full` reads everything again.
+   */
+  function readOptions(doc, { full = false, targets = [] } = {}) {
+    if (full) return {};
+    const always = new Set(targets);
+    const [likedId, liked] = Object.entries(doc.playlists).find(([, playlist]) => M().isReadOnly(playlist)) || [];
+    return {
+      read: (resource) => always.has(resource.id) || needsReading(doc, resource),
+      liked: liked?.syncedVersion ? { id: likedId, videoIds: liked.items.map((item) => item.videoId), version: liked.syncedVersion } : null,
+      knownVideos: new Set(Object.keys(doc.videos)),
+    };
+  }
+
   // ---------------------------------------------------------------------------
   // Pull
 
@@ -76,6 +118,7 @@
     for (const item of playlist.items) {
       if (item.itemId && now.has(item.itemId) && !held.has(item.itemId)) held.set(item.itemId, item);
     }
+    const reordered = followReorder(playlist, held, before, entries);
     const matched = new Set(held.values());
 
     let added = 0;
@@ -108,27 +151,54 @@
     });
 
     playlist.synced = entries.map((e) => e.itemId);
-    return { added, removed };
+    return { added, removed, reordered };
   }
 
   /**
-   * Pull: merges what YouTube has now (`remote`, from youtube-api.js) into the library.
-   * New playlists go to the top level; playlists deleted on YouTube are removed; within
-   * a playlist, entries added or removed on YouTube are added or removed here, while
-   * moves and removals made here (and not yet pushed) are kept. Returns a summary.
+   * Takes YouTube's order when it was changed there and not here: if the entries
+   * on both sides are still in the order they had at the last sync here, but not
+   * on YouTube, they're put in YouTube's order. Entries only here keep their places.
+   */
+  function followReorder(playlist, held, before, entries) {
+    const slots = []; // where the entries both sides have sit here
+    playlist.items.forEach((item, i) => {
+      if (before.has(item.itemId) && held.get(item.itemId) === item) slots.push(i);
+    });
+    const shared = new Set(slots.map((i) => playlist.items[i].itemId));
+    const here = slots.map((i) => playlist.items[i].itemId);
+    const then = (playlist.synced || []).filter((itemId) => shared.has(itemId));
+    const there = entries.map((e) => e.itemId).filter((itemId) => shared.has(itemId));
+    if (!sameOrder(here, then) || sameOrder(there, then)) return false;
+    const items = [...playlist.items];
+    there.forEach((itemId, k) => {
+      items[slots[k]] = held.get(itemId);
+    });
+    playlist.items = items;
+    return true;
+  }
+
+  /**
+   * Pull: merges what YouTube has now (`remote`, from fetchLibrary in youtube-api.js)
+   * into the library. New playlists go to the top level; playlists deleted on YouTube
+   * are removed; within a playlist that was read, entries added or removed on YouTube
+   * are added or removed here, while moves and removals made here (and not yet pushed)
+   * are kept. Playlists that weren't read haven't changed on YouTube. Returns a summary.
    */
   function merge(doc, remote, now = new Date()) {
     const model = M();
     const summary = {
       first: !Object.values(doc.playlists).some((p) => p.youtube),
+      read: 0,
       newPlaylists: [],
       removedPlaylists: [],
       renamed: [],
       changed: [],
       likedAdded: false,
       liked: null,
+      videosChanged: false, // whether doc.videos changed (it's large, so it's only saved when it did)
     };
     const remoteIds = new Set(remote.playlists.map((p) => p.id));
+    const read = remote.items || {};
 
     for (const [id, playlist] of Object.entries(doc.playlists)) {
       if (model.isReadOnly(playlist) || !playlist.youtube || remoteIds.has(id)) continue;
@@ -136,20 +206,23 @@
       summary.removedPlaylists.push(playlist.title);
     }
 
-    const described = remote.videos || {};
     const fallbacks = new Map(); // videoId → a YouTube entry, for videos YouTube no longer describes
     const remember = (entries) => {
       for (const e of entries) if (!fallbacks.has(e.videoId)) fallbacks.set(e.videoId, e.raw);
     };
 
     for (const raw of remote.playlists) {
-      const entries = entriesOf(remote.items[raw.id]);
+      if (!hasOwn(read, raw.id)) continue; // unchanged on YouTube since its entries were last read
+      summary.read++;
+      const entries = entriesOf(read[raw.id]);
       remember(entries);
       const title = raw.snippet?.title || 'Untitled playlist';
       const youtube = model.cleanResource(raw);
       const playlist = model.getPlaylist(doc, raw.id);
       if (!playlist) {
-        doc.playlists[raw.id] = { title, open: false, items: entries.map(toItem), youtube, synced: entries.map((e) => e.itemId) };
+        const added = { title, open: false, items: entries.map(toItem), youtube, synced: entries.map((e) => e.itemId) };
+        setVersion(added, raw.etag);
+        doc.playlists[raw.id] = added;
         doc.root.push(raw.id);
         summary.newPlaylists.push({ title, videos: entries.length });
         continue;
@@ -157,11 +230,12 @@
       if (playlist.title !== title) summary.renamed.push({ from: playlist.title, to: title });
       playlist.title = title;
       playlist.youtube = youtube;
-      const { added, removed } = mergeEntries(playlist, entries);
-      if (added || removed) summary.changed.push({ title, added, removed });
+      setVersion(playlist, raw.etag);
+      const { added, removed, reordered } = mergeEntries(playlist, entries);
+      if (added || removed || reordered) summary.changed.push({ title, added, removed, reordered });
     }
 
-    if (remote.liked) {
+    if (remote.liked && !remote.liked.unchanged) {
       const entries = entriesOf(remote.liked.items);
       remember(entries);
       let liked = model.getPlaylist(doc, remote.liked.id);
@@ -173,20 +247,34 @@
       liked.kind = model.LIKED;
       liked.items = entries.map(toItem);
       liked.synced = entries.map((e) => e.itemId).filter(Boolean);
-      summary.liked = entries.length;
+      setVersion(liked, remote.liked.version);
     }
+    if (remote.liked) summary.liked = model.getPlaylist(doc, remote.liked.id)?.items.length ?? null;
 
-    // Video details: YouTube's latest; videos it no longer describes are kept but marked unavailable.
-    for (const [id, video] of Object.entries(described)) doc.videos[id] = model.cleanResource(video);
-    for (const [id, raw] of fallbacks) {
-      if (Object.prototype.hasOwnProperty.call(described, id)) continue;
+    // Video details: YouTube's latest for the videos it was asked about; videos it no
+    // longer describes are kept but marked unavailable.
+    for (const [id, video] of Object.entries(remote.videos || {})) {
       const known = model.getVideo(doc, id);
-      if (!known) doc.videos[id] = model.unavailableVideo(id, raw);
+      if (video) doc.videos[id] = model.cleanResource(video);
+      else if (!known) doc.videos[id] = model.unavailableVideo(id, fallbacks.get(id) || {});
       else if (!known.unavailable) doc.videos[id] = { ...known, unavailable: true };
+      else continue;
+      summary.videosChanged = true;
     }
     const used = new Set();
-    for (const playlist of Object.values(doc.playlists)) for (const item of playlist.items) used.add(item.videoId);
-    for (const id of Object.keys(doc.videos)) if (!used.has(id)) delete doc.videos[id];
+    for (const playlist of Object.values(doc.playlists)) {
+      for (const item of playlist.items) {
+        used.add(item.videoId);
+        if (model.getVideo(doc, item.videoId)) continue;
+        doc.videos[item.videoId] = model.unavailableVideo(item.videoId, fallbacks.get(item.videoId) || {});
+        summary.videosChanged = true;
+      }
+    }
+    for (const id of Object.keys(doc.videos)) {
+      if (used.has(id)) continue;
+      delete doc.videos[id];
+      summary.videosChanged = true;
+    }
 
     doc.sync = { ...doc.sync, channelId: remote.channel.id, channelTitle: remote.channel.title, pulledAt: now.toISOString() };
 
@@ -212,8 +300,8 @@
     if (summary.likedAdded) details.push(`Added Liked videos (${plural(summary.liked, 'video')}) at the top`);
     for (const p of summary.newPlaylists) details.push(`New playlist “${p.title}” (${plural(p.videos, 'video')}), added at the top level`);
     for (const p of summary.changed) {
-      const parts = [p.added && `${plural(p.added, 'new video')}`, p.removed && `${p.removed} removed on YouTube`].filter(Boolean);
-      details.push(`“${p.title}”: ${parts.join(', ')}`);
+      const parts = [p.added && plural(p.added, 'new video'), p.removed && `${p.removed} removed`, p.reordered && 'reordered'].filter(Boolean);
+      details.push(`“${p.title}”: ${parts.join(', ')} on YouTube`);
     }
     for (const r of summary.renamed) details.push(`“${r.from}” was renamed to “${r.to}” on YouTube`);
     for (const title of summary.removedPlaylists) details.push(`“${title}” was deleted on YouTube, so it was removed here`);
@@ -309,10 +397,15 @@
     return ids;
   }
 
-  /** Everything a push would change on YouTube, playlist by playlist in tree order. */
-  function planPush(doc) {
+  /**
+   * Everything a push would change on YouTube, playlist by playlist in tree order.
+   * `only` (playlist IDs) limits it to those playlists.
+   */
+  function planPush(doc, only = null) {
+    const allowed = only && new Set(only);
     const playlists = [];
     for (const id of inTreeOrder(doc)) {
+      if (allowed && !allowed.has(id)) continue;
       const playlist = doc.playlists[id];
       if (M().isReadOnly(playlist) || !playlist.youtube || !Array.isArray(playlist.synced)) continue;
       const plan = planPlaylist(id, playlist);
@@ -349,7 +442,34 @@
     return err?.name !== 'ApiError' || err.status === undefined || err.status === 401 || err.status >= 500 || FATAL_REASONS.has(err.reason);
   }
 
-  const sameOrder = (a, b) => a.length === b.length && a.every((x, i) => x === b[i]);
+  /**
+   * Before a push: the playlists it changes will get new versions on YouTube. Until
+   * those are known (recordVersions), the next pull reads these playlists.
+   */
+  function forgetVersions(doc, ids) {
+    for (const id of ids) {
+      const playlist = M().getPlaylist(doc, id);
+      if (playlist) delete playlist.syncedVersion;
+    }
+  }
+
+  /**
+   * After a push: takes the pushed playlists' new versions from `resources` (the
+   * playlists as YouTube describes them now). A playlist whose number of videos
+   * isn't what the push left was also changed elsewhere meanwhile; it gets no
+   * version, so the next pull reads it.
+   */
+  function recordVersions(doc, ids, resources) {
+    const byId = new Map(resources.map((raw) => [raw.id, raw]));
+    for (const id of ids) {
+      const playlist = M().getPlaylist(doc, id);
+      const raw = byId.get(id);
+      if (!playlist || !raw?.etag || !Array.isArray(playlist.synced) || raw.contentDetails?.itemCount !== playlist.synced.length) continue;
+      playlist.title = raw.snippet?.title || playlist.title;
+      playlist.youtube = M().cleanResource(raw);
+      playlist.syncedVersion = raw.etag;
+    }
+  }
 
   /**
    * Push: applies `plan` with api.insert({ playlistId, videoId, position }),
@@ -477,13 +597,17 @@
   const sync = {
     QUOTA_PER_CHANGE,
     libraryChannel,
+    needsReading,
+    readOptions,
     merge,
     describePull,
     reorderMoves,
     planPush,
     pending,
     describePlan,
+    forgetVersions,
     executePush,
+    recordVersions,
     describePush,
   };
 
